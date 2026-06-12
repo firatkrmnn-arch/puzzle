@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Puzzle</title>
+<!--
+  DEPLOYMENT:
+  - Bu dosya repo root'ta index.html olarak durmalı
+  - Aynı root'ta bir "photos/" klasörü oluştur
+  - İçine 1.jpg, 2.png, 3.JPG ... şeklinde (1–100 arası) fotoğraf koy
+  - GitHub'a push et → Vercel otomatik yakalar, ekstra config gerekmez
+-->
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#111;
+  width:100vw; height:100vh;
+  display:flex; align-items:center; justify-content:center;
+  overflow:hidden;
+}
+#stage {
+  opacity:0;
+  transition: opacity 0.8s ease;
+  position:relative;
+}
+#stage.visible { opacity:1; }
+#puzzle-grid { position:relative; }
+.tile {
+  position:absolute;
+  background-repeat:no-repeat;
+  transition: top 0.2s ease, left 0.2s ease;
+}
+#loading-screen {
+  position:fixed; inset:0; background:#000;
+  display:flex; align-items:center; justify-content:center;
+  z-index:100; flex-direction:column; gap:16px;
+}
+#loading-screen p {
+  color:#555; font-family:monospace; font-size:13px;
+  letter-spacing:0.2em; text-transform:uppercase;
+}
+#celebration { position:fixed; inset:0; pointer-events:none; z-index:50; opacity:0; }
+#celebration.show { animation: cf 2.4s ease forwards; }
+@keyframes cf { 0%{opacity:0} 15%{opacity:1} 70%{opacity:1} 100%{opacity:0} }
+</style>
+</head>
+<body>
+
+<div id="loading-screen">
+  <p id="load-msg">fotoğraflar yükleniyor</p>
+  <p id="load-sub" style="color:#333;font-size:10px;letter-spacing:.15em">photos/ klasörü taranıyor…</p>
+</div>
+
+<div id="stage"><div id="puzzle-grid"></div></div>
+<div id="celebration">
+  <canvas id="cc" style="width:100%;height:100%;position:absolute;inset:0;"></canvas>
+</div>
+
+<script>
+// ── PUZZLE CONFIG ──────────────────────────────────────────────────────────
+const COLS = 9, ROWS = 9;
+const CELL = 70, GAP = 3;
+const PW = COLS * (CELL + GAP) - GAP;
+const PH = ROWS * (CELL + GAP) - GAP;
+
+// ── PHOTO CONFIG ───────────────────────────────────────────────────────────
+const PHOTO_FOLDER = 'photos';
+const MAX_PHOTOS   = 100;
+const EXTS = ['jpg','jpeg','png','JPG','JPEG','PNG','webp','gif'];
+
+// ── AI CONFIG ──────────────────────────────────────────────────────────────
+const MOVE_DELAY   = 360;   // temel hamle aralığı (ms)
+const JITTER       = 90;    // ± ms rastgele varyasyon
+const THINK_CHANCE = 0.07;  // "düşünme" pauzası olasılığı
+const THINK_MS     = [550, 900, 1350]; // pauza uzunlukları
+const DETOUR_PROB  = 0.30;  // her optimal hamlede sapma olasılığı
+const DETOUR_MIN   = 4;     // sapma min uzunluğu (hamle sayısı)
+const DETOUR_MAX   = 9;     // sapma max uzunluğu
+
+// ── STATE ──────────────────────────────────────────────────────────────────
+let photos = [], photoIndex = 0, imgSrc = null;
+let layout = [], tiles = [];
+let emptyC = 0, emptyR = 0;
+let aiRunning = false, aiTimer = null;
+let lastReverse  = null;        // son hamlenin tersi → geri alma önleme
+let detourLeft   = 0;           // kalan sapma hamlesi
+let detourTileId = null;        // sapma sırasında "yanlışlıkla" çalışılan tile
+
+// ── PHOTO DISCOVERY ────────────────────────────────────────────────────────
+// Her numara için uzantıları sırayla dene; ilk bulunanı döndür
+async function findPhotoN(n) {
+  for (const ext of EXTS) {
+    const url = `${PHOTO_FOLDER}/${n}.${ext}`;
+    const found = await new Promise(resolve => {
+      const img = new Image();
+      img.onload  = () => resolve(url);
+      img.onerror = () => resolve(null);
+      img.src = url;
+    });
+    if (found) return found;
+  }
+  return null;
+}
+
+// 1–100 arası tüm numaraları paralel tara
+async function discoverPhotos() {
+  const results = await Promise.all(
+    Array.from({length: MAX_PHOTOS}, (_, i) => findPhotoN(i + 1))
+  );
+  photos = results.filter(Boolean); // null'ları at, sıra korunur
+
+  if (!photos.length) {
+    document.getElementById('load-msg').textContent = 'fotoğraf bulunamadı';
+    document.getElementById('load-sub').textContent =
+      'photos/ klasörüne 1.jpg, 2.jpg … ekle';
+    return;
+  }
+
+  document.getElementById('load-sub').textContent =
+    `${photos.length} fotoğraf bulundu`;
+  await new Promise(r => setTimeout(r, 600));
+  document.getElementById('loading-screen').style.display = 'none';
+  loadPhoto(0);
+}
+
+// ── PHOTO LOADER ───────────────────────────────────────────────────────────
+function loadPhoto(idx) {
+  photoIndex = idx % photos.length;
+  imgSrc = photos[photoIndex];
+  const stage = document.getElementById('stage');
+  stage.classList.remove('visible');
+  setTimeout(() => {
+    stopAI();
+    initPuzzle();
+    stage.classList.add('visible');
+    setTimeout(startAI, 900);
+  }, 750);
+}
+
+// ── LAYOUT ─────────────────────────────────────────────────────────────────
+function generateLayout() {
+  const result = [];
+  let id = 0;
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      result.push({id: id++, c, r, w:1, h:1});
+  return result;
+}
+
+// ── INIT ───────────────────────────────────────────────────────────────────
+function initPuzzle() {
+  layout = generateLayout();
+  const hole = layout[Math.floor(Math.random() * layout.length)];
+  emptyC = hole.c; emptyR = hole.r;
+  tiles = layout.filter(t => t.id !== hole.id).map(t => ({...t}));
+
+  for (let i = 0; i < 1500; i++) {
+    const moves = getLegalMoves(tiles, emptyC, emptyR);
+    if (!moves.length) break;
+    const m = moves[Math.floor(Math.random() * moves.length)];
+    const res = applyMoveClone(tiles, emptyC, emptyR, m);
+    tiles = res.tiles; emptyC = res.ec; emptyR = res.er;
+  }
+
+  renderFull();
+}
+
+// ── MOVE LOGIC ─────────────────────────────────────────────────────────────
+function getLegalMoves(tArr, ec, er) {
+  const result = [];
+  for (const t of tArr) {
+    let dc = 0, dr = 0, found = false;
+    outer:
+    for (let ddr = 0; ddr < t.h; ddr++) {
+      for (let ddc = 0; ddc < t.w; ddc++) {
+        const tc = t.c + ddc, tr = t.r + ddr;
+        if (tc === ec && tr === er-1) { dc=0;  dr=1;  found=true; break outer; }
+        if (tc === ec && tr === er+1) { dc=0;  dr=-1; found=true; break outer; }
+        if (tr === er && tc === ec-1) { dc=1;  dr=0;  found=true; break outer; }
+        if (tr === er && tc === ec+1) { dc=-1; dr=0;  found=true; break outer; }
+      }
+    }
+    if (!found) continue;
+    const nc = t.c+dc, nr = t.r+dr;
+    if (nc<0||nr<0||nc+t.w>COLS||nr+t.h>ROWS) continue;
+    let ok = true;
+    for (const ot of tArr) {
+      if (ot.id===t.id) continue;
+      if (nc<ot.c+ot.w && nc+t.w>ot.c && nr<ot.r+ot.h && nr+t.h>ot.r) {
+        ok=false; break;
+      }
+    }
+    if (ok) result.push({id:t.id, dc, dr});
+  }
+  return result;
+}
+
+function applyMoveClone(tArr, ec, er, move) {
+  return {
+    tiles: tArr.map(t => t.id===move.id
+      ? {...t, c:t.c+move.dc, r:t.r+move.dr} : {...t}),
+    ec: ec-move.dc, er: er-move.dr
+  };
+}
+
+function applyMoveMut(move) {
+  const t = tiles.find(x => x.id===move.id);
+  t.c+=move.dc; t.r+=move.dr;
+  emptyC-=move.dc; emptyR-=move.dr;
+}
+
+// ── RENDER ─────────────────────────────────────────────────────────────────
+function renderFull() {
+  const grid = document.getElementById('puzzle-grid');
+  grid.innerHTML = '';
+  grid.style.width  = PW+'px'; grid.style.height = PH+'px';
+  document.getElementById('stage').style.width  = PW+'px';
+  document.getElementById('stage').style.height = PH+'px';
+
+  for (const t of tiles) {
+    const el = document.createElement('div');
+    el.className = 'tile'; el.dataset.id = t.id;
+    const tw = t.w*(CELL+GAP)-GAP, th = t.h*(CELL+GAP)-GAP;
+    el.style.width  = tw+'px';
+    el.style.height = th+'px';
+    el.style.left   = (t.c*(CELL+GAP))+'px';
+    el.style.top    = (t.r*(CELL+GAP))+'px';
+    const orig = layout.find(l => l.id===t.id);
+    el.style.backgroundImage    = `url(${imgSrc})`;
+    el.style.backgroundSize     = `${PW}px ${PH}px`;
+    el.style.backgroundPosition = `-${orig.c*(CELL+GAP)}px -${orig.r*(CELL+GAP)}px`;
+    grid.appendChild(el);
+  }
+
+  const em = document.createElement('div');
+  em.id = 'empty-el';
+  em.style.cssText =
+    `position:absolute;width:${CELL}px;height:${CELL}px;background:#111;` +
+    `left:${emptyC*(CELL+GAP)}px;top:${emptyR*(CELL+GAP)}px;`;
+  grid.appendChild(em);
+}
+
+function renderPositions() {
+  const grid = document.getElementById('puzzle-grid');
+  for (const t of tiles) {
+    const el = grid.querySelector(`[data-id="${t.id}"]`);
+    if (el) {
+      el.style.left = (t.c*(CELL+GAP))+'px';
+      el.style.top  = (t.r*(CELL+GAP))+'px';
+    }
+  }
+  const em = document.getElementById('empty-el');
+  if (em) {
+    em.style.left = (emptyC*(CELL+GAP))+'px';
+    em.style.top  = (emptyR*(CELL+GAP))+'px';
+  }
+}
+
+// ── SOLVED / HEURISTIC ─────────────────────────────────────────────────────
+function isSolved(tArr) {
+  tArr = tArr || tiles;
+  for (const t of tArr) {
+    const orig = layout.find(l => l.id===t.id);
+    if (t.c!==orig.c || t.r!==orig.r) return false;
+  }
+  return true;
+}
+
+function heuristic(tArr) {
+  let d = 0;
+  for (const t of tArr) {
+    const orig = layout.find(l => l.id===t.id);
+    d += Math.abs(t.c-orig.c) + Math.abs(t.r-orig.r);
+  }
+  return d;
+}
+
+// ── BEAM SEARCH ────────────────────────────────────────────────────────────
+function beamSearch() {
+  if (isSolved()) return [];
+  const BEAM = 8, DEPTH = 120;
+  let beams = [{
+    tiles: tiles.map(t=>({...t})), ec:emptyC, er:emptyR, path:[]
+  }];
+  const seen = new Set([stateKey(tiles, emptyC, emptyR)]);
+
+  for (let d = 0; d < DEPTH; d++) {
+    const next = [];
+    for (const b of beams) {
+      for (const m of getLegalMoves(b.tiles, b.ec, b.er)) {
+        const res = applyMoveClone(b.tiles, b.ec, b.er, m);
+        const key = stateKey(res.tiles, res.ec, res.er);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const path = [...b.path, m];
+        if (isSolved(res.tiles)) return path;
+        next.push({...res, path, h: heuristic(res.tiles)});
+      }
+    }
+    if (!next.length) break;
+    next.sort((a,b) => a.h-b.h);
+    beams = next.slice(0, BEAM);
+    if (beams[0].h === 0) return beams[0].path;
+  }
+  return beams[0]?.path?.length ? beams[0].path : null;
+}
+
+function stateKey(tArr, ec, er) {
+  return tArr.map(t=>`${t.id}:${t.c},${t.r}`).sort().join('|')
+    + `|${ec},${er}`;
+}
+
+// ── AI HELPERS ─────────────────────────────────────────────────────────────
+function pick(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
+
+// Son hamlenin tam tersini listeden çıkar (ileri-geri sarkaç önleme)
+function withoutReversal(moves) {
+  if (!lastReverse) return moves;
+  const f = moves.filter(m =>
+    !(m.id===lastReverse.id && m.dc===lastReverse.dc && m.dr===lastReverse.dr)
+  );
+  return f.length ? f : moves; // tek seçenek geri almaksa mecburen izin ver
+}
+
+// Belirli bir tile için hedefe en yakın yasal hamleyi bul (greedy)
+function greedyForTile(tileId, candidates) {
+  const orig = layout.find(l => l.id===tileId);
+  const tile = tiles.find(t => t.id===tileId);
+  if (!orig || !tile) return null;
+  let best=null, bestD=Infinity;
+  for (const m of candidates) {
+    if (m.id !== tileId) continue;
+    const d = Math.abs(tile.c+m.dc - orig.c) + Math.abs(tile.r+m.dr - orig.r);
+    if (d < bestD) { bestD=d; best=m; }
+  }
+  return best;
+}
+
+// Sapma için: optimal'in söylediği tile dışında, yerinden oynamış bir tile seç
+function pickDetourTile(excludeId, candidates) {
+  const movable = new Set(candidates.map(m => m.id));
+  const pool = tiles
+    .filter(t => t.id!==excludeId && movable.has(t.id))
+    .map(t => {
+      const orig = layout.find(l => l.id===t.id);
+      return {id:t.id, dist: Math.abs(t.c-orig.c)+Math.abs(t.r-orig.r)};
+    })
+    .filter(t => t.dist > 0)        // zaten yerine oturmamış olanlar
+    .sort((a,b) => b.dist - a.dist) // en çok yerinden oynamış önce
+    .slice(0, 6);                   // üstten 6 aday
+
+  if (!pool.length) return null;
+  // Üstten 3 içinde rastgele seç → davranış biraz farklılaşır
+  return pool[Math.floor(Math.random() * Math.min(3, pool.length))].id;
+}
+
+// ── AI CORE ────────────────────────────────────────────────────────────────
+function startAI() {
+  aiRunning=true; lastReverse=null; detourLeft=0; detourTileId=null;
+  aiStep();
+}
+function stopAI() { clearTimeout(aiTimer); aiRunning=false; }
+
+function aiStep() {
+  if (!aiRunning) return;
+  if (isSolved()) { onSolved(); return; }
+
+  const legal = getLegalMoves(tiles, emptyC, emptyR);
+  if (!legal.length) { aiTimer=setTimeout(aiStep, MOVE_DELAY); return; }
+
+  const cands = withoutReversal(legal);
+  let chosen = null;
+  let extra  = 0; // ek gecikme ms
+
+  // ── Aktif sapma: başka bir tile'ı greedy çöz ──
+  if (detourLeft>0 && detourTileId!==null) {
+    chosen = greedyForTile(detourTileId, cands) || pick(cands);
+    if (--detourLeft === 0) detourTileId = null;
+
+  // ── Normal: beam search + sapma kararı ──
+  } else {
+    const path = beamSearch();
+    const optMove = path?.length
+      ? cands.find(m => m.id===path[0].id && m.dc===path[0].dc && m.dr===path[0].dr)
+      : null;
+
+    if (optMove && Math.random() < DETOUR_PROB) {
+      // Farklı bir tile'a odaklan, orada greedy çalış
+      const dId = pickDetourTile(optMove.id, cands);
+      if (dId !== null) {
+        const dMove = greedyForTile(dId, cands);
+        if (dMove) {
+          chosen      = dMove;
+          detourTileId = dId;
+          detourLeft  = DETOUR_MIN + Math.floor(Math.random()*(DETOUR_MAX-DETOUR_MIN));
+          extra       = 120 + Math.floor(Math.random()*180); // hafif tereddüt
+        }
+      }
+    }
+
+    if (!chosen) chosen = optMove || pick(cands);
+
+    // Ara sıra "dur düşün" pauzası
+    if (Math.random() < THINK_CHANCE)
+      extra += pick(THINK_MS);
+  }
+
+  lastReverse = {id:chosen.id, dc:-chosen.dc, dr:-chosen.dr};
+  applyMoveMut(chosen);
+  renderPositions();
+
+  if (isSolved()) { setTimeout(onSolved, 400); return; }
+
+  const delay = MOVE_DELAY
+    + Math.round((Math.random()*2-1)*JITTER)
+    + extra;
+  aiTimer = setTimeout(aiStep, Math.max(50, delay));
+}
+
+// ── CELEBRATION ────────────────────────────────────────────────────────────
+function onSolved() {
+  stopAI();
+  celebrate();
+  setTimeout(() => {
+    document.getElementById('stage').classList.remove('visible');
+    setTimeout(() => loadPhoto(photoIndex+1), 800);
+  }, 2400);
+}
+
+function celebrate() {
+  const el     = document.getElementById('celebration');
+  const canvas  = document.getElementById('cc');
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+
+  const ctx  = canvas.getContext('2d');
+  const cols = ['#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#fff','#ff922b','#cc5de8'];
+  const pts  = Array.from({length:120}, () => ({
+    x:  Math.random()*canvas.width,
+    y:  -20 - Math.random()*100,
+    vx: (Math.random()-.5)*6,
+    vy: Math.random()*5+2,
+    w:  Math.random()*10+4,
+    h:  Math.random()*5+3,
+    rot: Math.random()*Math.PI*2,
+    rv:  (Math.random()-.5)*0.2,
+    col: cols[Math.floor(Math.random()*cols.length)]
+  }));
+
+  let f = 0;
+  (function draw() {
+    if (f++ > 120) { ctx.clearRect(0,0,canvas.width,canvas.height); return; }
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    pts.forEach(p => {
+      p.x+=p.vx; p.y+=p.vy; p.rot+=p.rv;
+      ctx.save();
+      ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+      ctx.fillStyle = p.col;
+      ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+      ctx.restore();
+    });
+    requestAnimationFrame(draw);
+  })();
+
+  setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+// ── BOOT ───────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', discoverPhotos);
+</script>
+</body>
+</html>
